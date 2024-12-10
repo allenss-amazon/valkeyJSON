@@ -63,6 +63,19 @@ int get_json_value(ValkeyModuleCtx *ctx, const char *keyname, const size_t key_l
 int get_json_values_and_types(ValkeyModuleCtx *ctx, const char *keyname, const size_t key_len, const char **paths,
                     const int num_paths, char ***values, size_t **lengths, char ***types, size_t **type_lengths);
 
+/* *
+ * Get a reference counted pointer to a vector iff:
+ * * The first value it hits is an all number array with the right number (dimensionality) of all number elements and it successfully converts it.
+ * * The first value it hits is a vector of the correct dimensionality already.
+ * Otherwise, it returns `nullptr` on failure.
+ * Note that when calling this function, we use RedisModule_AMZ_SharedMemory_Clone() to make increment the reference counting to this memory.
+ * So if a caller successfully gets a non-null pointer, at some point, that caller must call RedisModule_AMZ_SharedMemory_Drop() on the memory.
+ * @vector output param, the JSON vector value is stored in it.
+ * @ return 0 - success, -1 - error
+ */
+int get_json_vector_f32(ValkeyModuleCtx *ctx, const char *keyname, const size_t key_len, const char *path,
+        const size_t dimensionality, float **vector);
+
 #ifdef __cplusplus
 }
 #endif

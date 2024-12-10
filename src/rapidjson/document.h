@@ -753,7 +753,7 @@ public:
     */
     explicit GenericValue(Type type) RAPIDJSON_NOEXCEPT : data_() {
         static const uint16_t defaultFlags[] = {
-            kNullFlag, kFalseFlag, kTrueFlag, kObjectVecFlag, kArrayFlag, kShortStringFlag,
+            kNullFlag, kFalseFlag, kTrueFlag, kObjectVecFlag, kArrayJVFlag, kShortStringFlag,
             kNumberAnyFlag
         };
         RAPIDJSON_NOEXCEPT_ASSERT(type >= kNullType && type <= kNumberType);
@@ -779,13 +779,23 @@ public:
             break;
         case kArrayType: {
                 SizeType count = rhs.data_.a.size;
-                GenericValue* le = reinterpret_cast<GenericValue*>(allocator.Malloc(count * sizeof(GenericValue)));
-                const GenericValue<Encoding,SourceAllocator>* re = rhs.GetElementsPointer();
-                for (SizeType i = 0; i < count; i++)
-                    new (&le[i]) GenericValue(re[i], allocator, copyConstStrings);
-                data_.f.flags = kArrayFlag;
-                data_.a.size = data_.a.capacity = count;
-                SetElementsPointer(le);
+                if (rhs.IsArrayVec()) {
+                    VectorType type = kFloat32Type; // only current type available
+                    float* shared_array_memory = static_cast<float*>(ValkeyModule_AMZ_SharedMemory_Malloc(sizeof(float)*count, type, RJMalloc, RJFree));
+                    float* rhp = static_cast<float*>(rhs.GetElementsPointerVec());
+                    std::copy(rhp, rhp + count, shared_array_memory);
+                    data_.f.flags = kArrayVecFlag;
+                    data_.a.size = data_.a.capacity = count;
+                    SetElementsPointerVec(shared_array_memory, type);
+                } else {
+                    GenericValue* le = reinterpret_cast<GenericValue*>(allocator.Malloc(count * sizeof(GenericValue)));
+                    const GenericValue<Encoding,SourceAllocator>* re = rhs.GetElementsPointer();
+                    for (SizeType i = 0; i < count; i++)
+                        new (&le[i]) GenericValue(re[i], allocator, copyConstStrings);
+                    data_.f.flags = kArrayJVFlag;
+                    data_.a.size = data_.a.capacity = count;
+                    SetElementsPointer(le);
+                }
             }
             break;
         case kStringType:
@@ -920,7 +930,7 @@ public:
     */
     GenericValue(Array a) RAPIDJSON_NOEXCEPT : data_(a.value_.data_) {
         a.value_.data_ = Data();
-        a.value_.data_.f.flags = kArrayFlag;
+        a.value_.data_.f.flags = kArrayJVFlag;
     }
 
     //! Constructor for Object.
@@ -944,7 +954,7 @@ public:
                                      internal::IsRefCounted<Allocator>::Value)) {
             switch(data_.f.flags) {
 
-            case kArrayFlag:
+            case kArrayJVFlag:
                 {
                     GenericValue* e = GetElementsPointer();
                     for (GenericValue* v = e; v != e + data_.a.size; ++v)
@@ -952,6 +962,15 @@ public:
                     if (Allocator::kNeedFree) { // Shortcut by Allocator's trait
                         Allocator::Free(e);
                     }
+                }
+                break;
+
+            case kArrayVecFlag:
+                // We have a bunch of floats that need to be un-counted.
+                // None of them will have the extra double string characters
+                // because float is not that high precision!
+                if (Allocator::kNeedFree) { // should be true
+                    ValkeyModule_AMZ_SharedMemory_Drop(GetElementsPointerVec());
                 }
                 break;
 
@@ -1194,7 +1213,8 @@ public:
     bool IsBool()   const { return (data_.f.flags & kBoolFlag) != 0; }
     bool IsObject() const { return GetType() == kObjectType; }
     bool IsObjectHT() const { return (data_.f.flags & kHashTableFlag) != 0; }
-    bool IsArray()  const { return data_.f.flags == kArrayFlag; }
+    bool IsArray()  const { return GetType() == kArrayType; }
+    bool IsArrayVec() const { return (data_.f.flags == kArrayVecFlag) != 0; }
     bool IsNumber() const { return (data_.f.flags & kNumberFlag) != 0; }
     bool IsInt()    const { return (data_.f.flags & kIntFlag) != 0; }
     bool IsUint()   const { return (data_.f.flags & kUintFlag) != 0; }
@@ -1202,8 +1222,8 @@ public:
     bool IsUint64() const { return (data_.f.flags & kUint64Flag) != 0; }
     bool IsDouble() const { return (data_.f.flags & kDoubleFlag) != 0; }
     bool IsString() const { return (data_.f.flags & kStringFlag) != 0; }
-    bool IsShortString() const { return (data_.f.flags & kShortStringFlag) != 0;}
-    bool IsShortDouble() const { return (data_.f.flags & kNumberShortDoubleFlag) != 0;}
+    bool IsShortString() const { return data_.f.flags == kShortStringFlag;}
+    bool IsShortDouble() const { return data_.f.flags == kNumberShortDoubleFlag;}
     bool IsHandle() const { return data_.f.flags == kHandleFlag; }
 
     // Checks whether a number can be losslessly converted to a double.
@@ -1705,6 +1725,7 @@ public:
         \note Linear time complexity.
     */
     void Clear(Allocator &allocator) {
+        GuaranteeArrayJV(allocator);
         GenericValue* e = GetElementsPointer();
         for (GenericValue* v = e; v != e + data_.a.size; ++v)
             v->~GenericValue();
@@ -1712,16 +1733,34 @@ public:
     }
 
     //! Get an element from array by index.
-    /*! \pre IsArray() == true
+    /*! \pre IsArray() == true, IsArrayVec() == false
         \param index Zero-based index of element.
         \see operator[](T*)
     */
     GenericValue& operator[](SizeType index) {
-        RAPIDJSON_ASSERT(IsArray());
+        RAPIDJSON_ASSERT(IsArray() && !IsArrayVec());
         RAPIDJSON_ASSERT(index < data_.a.size);
         return GetElementsPointer()[index];
     }
     const GenericValue& operator[](SizeType index) const { return const_cast<GenericValue&>(*this)[index]; }
+
+    VectorType GetVectorType() const {
+        return static_cast<VectorType>(ValkeyModule_AMZ_SharedMemory_GetMetaData(GetElementsPointerVec()));
+    }
+
+    //! Get a float from a vector array by index
+    /*! \pre IsArray() == true, IsArrayVec() == true, GetVectorType() == kFloat32Type */
+    float& GetVecFloat(SizeType index) {
+        RAPIDJSON_ASSERT(IsArray() && IsArrayVec());
+        RAPIDJSON_ASSERT(index < data_.a.size);
+        RAPIDJSON_ASSERT(GetVectorType() == kFloat32Type);
+        return static_cast<float*>(GetElementsPointerVec())[index];
+    }
+    const float& GetVecFloat(SizeType index) const { return const_cast<GenericValue&>(*this).GetVecFloat(index); }
+
+    float* GetVectorSharedPointer() {
+        return static_cast<float*>(ValkeyModule_AMZ_SharedMemory_Clone(GetElementsPointerVec()));
+    }
 
     //! Element iterator
     /*! \pre IsArray() == true */
@@ -1736,6 +1775,121 @@ public:
     /*! \pre IsArray() == true */
     ConstValueIterator End() const { return const_cast<GenericValue&>(*this).End(); }
 
+    void GuaranteeArrayJV(Allocator &allocator) {
+        RAPIDJSON_ASSERT(IsArray());
+        if (IsArrayVec()) {
+            ConvertArrayVecToJV(allocator);
+        }
+    }
+
+    void ConvertArrayVecToJV(Allocator &allocator) {
+        RAPIDJSON_ASSERT(IsArrayVec());
+        SizeType count = data_.a.size;
+        VectorType type = GetVectorType();
+
+        // In the future, when we support more/all types, a lot of this code should be outside the switch to avoid duplication,
+        // but in the meantime, we don't want to only do part of this action.
+        switch (type) {
+        case kFloat32Type:
+            {
+                //
+                // Save the current array locally
+                //
+                GenericValue me(kArrayType);
+                me.Swap(*this);
+
+                //
+                // Fill current array node and label it JValue Array
+                //
+                float* fp = static_cast<float*>(me.GetElementsPointerVec());
+                for (SizeType i = 0; i < count; i++) {
+                    double d = fp[i];
+                    char str[BUF_SIZE_DOUBLE_JSON];
+                    size_t str_len = jsonutil_double_to_string(d, str, sizeof(str));
+                    PushBack(GenericValue(str, str_len, allocator, false, /* isdouble */ true), allocator);
+                }
+                data_.f.flags = kArrayJVFlag;
+
+                //
+                // Now kill the temp, don't use the destructor because we know all of the elements are empty.
+                //
+                me.data_.f.flags = kNullFlag;
+                ValkeyModule_AMZ_SharedMemory_Drop(me.GetElementsPointerVec());
+            }
+            break;
+
+        default:
+            RAPIDJSON_ASSERT(nullptr == "Only f32 Vectors currently supported. Unclear how other type was created.");
+            break;
+        }
+    }
+
+    // this needs to return a status of some sort if it fails
+    bool ConvertArrayJVToVec(Allocator &allocator, size_t dimensions, VectorType type) {
+        RAPIDJSON_ASSERT(IsArray() && !IsArrayVec());
+
+        //
+        // Validate first. Must be the right length and all numbers.
+        //
+        SizeType count = data_.a.size;
+        if (count != dimensions) {
+            return false;
+        }
+        GenericValue* e = GetElementsPointer();
+        for (GenericValue* v = e; v != e + count; ++v) {
+            if (v->GetType() != kNumberType) {
+                return false;
+            }
+        }
+
+        // In the future, when we support more/all types, a lot of this code should be outside the switch to avoid duplication,
+        // but in the meantime, we don't want to only do part of this action.
+        switch (type) {
+        case kFloat32Type:
+            {
+                //
+                // Save the current array locally
+                //
+                GenericValue me(kArrayType);
+                me.Swap(*this);
+
+                // Allocate my slab of memory here with shared alloc
+                // do a static cast
+                float* shared_array_memory = static_cast<float*>(ValkeyModule_AMZ_SharedMemory_Malloc(sizeof(float)*count, type, RJMalloc, RJFree));
+                SetElementsPointerVec(shared_array_memory, type);
+
+                //
+                // Fill current array node and label it Vector Array
+                //
+                for (GenericValue* v = e; v != e + count; ++v) {
+                    float f = v->GetDouble();
+                    *shared_array_memory++ = f;
+                    data_.a.size++;
+                    if (v->IsDouble()) {
+                        if (!v->IsShortDouble()) {
+                            allocator.Free(const_cast<Ch*>(v->GetStringPointer()));
+                        }
+                    }
+                }
+                data_.f.flags = kArrayVecFlag;
+
+                //
+                // Now kill the temp, don't use the destructor because we know all of the elements are empty.
+                //
+                me.data_.f.flags = kNullFlag;
+                allocator.Free(me.GetElementsPointer());
+            }
+            break;
+
+        default:
+            RAPIDJSON_ASSERT(nullptr == "Only f32 Vectors currently supported. Cannot create other type of vector array.");
+            return false;
+        }
+
+
+        return true;
+    }
+
     //! Request the array to have enough capacity to store elements.
     /*! \param newCapacity  The capacity that the array at least need to have.
         \param allocator    Allocator for reallocating memory. It must be the same one as used before. Commonly use GenericDocument::GetAllocator().
@@ -1743,6 +1897,7 @@ public:
         \note Linear time complexity.
     */
     GenericValue& Reserve(SizeType newCapacity, Allocator &allocator) {
+        GuaranteeArrayJV(allocator);
         if (newCapacity > data_.a.capacity) {
             SetElementsPointer(reinterpret_cast<GenericValue*>(allocator.Realloc(GetElementsPointer(), data_.a.capacity * sizeof(GenericValue), newCapacity * sizeof(GenericValue))));
             data_.a.capacity = newCapacity;
@@ -1761,6 +1916,7 @@ public:
         \note Amortized constant time complexity.
     */
     GenericValue& PushBack(GenericValue& value, Allocator& allocator) {
+        GuaranteeArrayJV(allocator);
         if (data_.a.size >= data_.a.capacity)
             Reserve(data_.a.capacity == 0 ? kDefaultArrayCapacity : (data_.a.capacity + (data_.a.capacity + 1) / 2), allocator);
         GetElementsPointer()[data_.a.size++].RawAssign(value, true);
@@ -1815,6 +1971,7 @@ public:
         \note Constant time complexity.
     */
     GenericValue& PopBack(Allocator& allocator) {
+        GuaranteeArrayJV(allocator);
         RAPIDJSON_ASSERT(!Empty());
         GetElementsPointer()[--data_.a.size].~GenericValue();
         return *this;
@@ -1827,8 +1984,8 @@ public:
         \return Iterator following the removed element. If the iterator pos refers to the last element, the End() iterator is returned.
         \note Linear time complexity.
     */
-    ValueIterator Erase(ConstValueIterator pos) {
-        return Erase(pos, pos + 1);
+    ValueIterator EraseJV(ConstValueIterator pos) {
+        return EraseJV(pos, pos + 1);
     }
 
     //! Remove elements in the range [first, last) of the array.
@@ -1839,8 +1996,9 @@ public:
         \return Iterator following the last removed element.
         \note Linear time complexity.
     */
-    ValueIterator Erase(ConstValueIterator first, ConstValueIterator last) {
+    ValueIterator EraseJV(ConstValueIterator first, ConstValueIterator last) {
         RAPIDJSON_ASSERT(IsArray());
+        RAPIDJSON_ASSERT(!IsArrayVec()); // should be converted before calling, or pointers will be wrong
         RAPIDJSON_ASSERT(data_.a.size > 0);
         RAPIDJSON_ASSERT(GetElementsPointer() != 0);
         RAPIDJSON_ASSERT(first >= Begin());
@@ -2022,9 +2180,25 @@ public:
         case kArrayType:
             if (RAPIDJSON_UNLIKELY(!handler.StartArray()))
                 return false;
-            for (ConstValueIterator v = Begin(); v != End(); ++v)
+            if (IsArrayVec()) {
+                switch (GetVectorType()) {
+                case kFloat32Type:
+                    for (SizeType i = 0; i < data_.a.size; i++) {
+                        if (RAPIDJSON_UNLIKELY(!handler.Double(static_cast<double>(GetVecFloat(i)))))
+                            return false;
+                    }
+                    break;
+
+                default:
+                    RAPIDJSON_ASSERT(nullptr == "Only f32 Vectors currently supported. Cannot print other type of vector pointer.");
+                    return false;
+                }
+            } else {
+                for (ConstValueIterator v = Begin(); v != End(); ++v) {
                 if (RAPIDJSON_UNLIKELY(!v->Accept(handler)))
                     return false;
+                }
+            }
             return handler.EndArray(data_.a.size);
     
         case kStringType:
@@ -2095,7 +2269,8 @@ private:
         kShortStringFlag = static_cast<int>(kStringType) | static_cast<int>(kStringFlag | kCopyFlag | kInlineStrFlag),
         kObjectVecFlag = kObjectType,
         kObjectHTFlag = static_cast<int>(kObjectType) | static_cast<int>(kHashTableFlag),
-        kArrayFlag = kArrayType,
+        kArrayJVFlag = kArrayType,
+        kArrayVecFlag = static_cast<int>(kArrayType) | static_cast<int>(kVectorFlag),
 
         kTypeMask = 0x07
     };
@@ -2177,7 +2352,10 @@ private:
     struct ArrayData {
         SizeType size;
         SizeType capacity;
+        union {
         GenericValue* elements;
+            float* elementsVec;
+        } u;
     };  // 12 bytes in 32-bit mode, 16 bytes in 64-bit mode
 
     struct HandleData {
@@ -2208,8 +2386,20 @@ private:
 
     RAPIDJSON_FORCEINLINE const Ch* GetStringPointer(bool validate = true) const { return DataString(data_, validate); }
     RAPIDJSON_FORCEINLINE const Ch* SetStringPointer(const Ch* str) { return RAPIDJSON_SETPOINTER(Ch, data_.s.str, str); }
-    RAPIDJSON_FORCEINLINE GenericValue* GetElementsPointer(bool validate = true) const { return MEMORY_VALIDATE(RAPIDJSON_GETPOINTER(GenericValue, data_.a.elements), validate); }
-    RAPIDJSON_FORCEINLINE GenericValue* SetElementsPointer(GenericValue* elements) { MEMORY_VALIDATE(elements); return RAPIDJSON_SETPOINTER(GenericValue, data_.a.elements, elements); }
+    RAPIDJSON_FORCEINLINE GenericValue* GetElementsPointer(bool validate = true) const { return MEMORY_VALIDATE(RAPIDJSON_GETPOINTER(GenericValue, data_.a.u.elements), validate); }
+    RAPIDJSON_FORCEINLINE GenericValue* SetElementsPointer(GenericValue* elements) { MEMORY_VALIDATE(elements); return RAPIDJSON_SETPOINTER(GenericValue, data_.a.u.elements, elements); }
+    RAPIDJSON_FORCEINLINE void* GetElementsPointerVec() const { return RAPIDJSON_GETPOINTER(void, data_.a.u.elementsVec); }
+
+    RAPIDJSON_FORCEINLINE void* SetElementsPointerVec(void* elementsVec, VectorType type) {
+        switch (type) {
+        case kFloat32Type:
+            return RAPIDJSON_SETPOINTER(float, data_.a.u.elementsVec, static_cast<float*>(elementsVec));
+
+        default:
+            RAPIDJSON_ASSERT(nullptr == "Only f32 Vectors currently supported. Cannot create other type of vector pointer.");
+            return nullptr;
+        }
+    }
 
     RAPIDJSON_FORCEINLINE bool MembersPointerIsNull() const { return RAPIDJSON_GETPOINTER(Member, data_.o.u.members) == nullptr; }
 
@@ -2891,7 +3081,7 @@ public:
 private:
     // Initialize this value as array with initial data, without calling destructor.
     void SetArrayRaw(GenericValue* values, SizeType count, Allocator& allocator) {
-        data_.f.flags = kArrayFlag;
+        data_.f.flags = kArrayJVFlag;
         if (count) {
             GenericValue* e = static_cast<GenericValue*>(allocator.Malloc(count * sizeof(GenericValue)));
             SetElementsPointer(e);
@@ -2978,6 +3168,8 @@ public:
             return GetMembersPointerHT(validate);
         } else if (IsObject()) {
             return GetMembersPointerVec(validate);
+        } else if (IsArrayVec()) { // check must come before IsArray()
+            return GetElementsPointerVec();
         } else if (IsArray()) {
             return GetElementsPointer(validate);
         } else if (IsDouble() && 0 == (data_.f.flags & kInlineStrFlag)) {
@@ -3020,7 +3212,7 @@ public:
         \param stackAllocator   Optional allocator for allocating memory for stack.
     */
     explicit GenericDocument(Type type, Allocator* allocator = 0, size_t stackCapacity = kDefaultStackCapacity, StackAllocator* stackAllocator = 0) :
-            GenericValue<Encoding, Allocator>(type),  allocator_(allocator), ownAllocator_(0), stack_(stackAllocator, stackCapacity), parseResult_(), curDepth_(0), maxDepth_(0)
+            GenericValue<Encoding, Allocator>(type),  allocator_(allocator), ownAllocator_(0), stack_(stackAllocator, stackCapacity), parseResult_(), curDepth_(0), maxDepth_(0) // AMZN
     {
         if (!allocator_)
             ownAllocator_ = allocator_ = RAPIDJSON_NEW(Allocator)();
@@ -3033,7 +3225,7 @@ public:
         \param stackAllocator   Optional allocator for allocating memory for stack.
     */
     GenericDocument(Allocator* allocator = 0, size_t stackCapacity = kDefaultStackCapacity, StackAllocator* stackAllocator = 0) :
-            allocator_(allocator), ownAllocator_(0), stack_(stackAllocator, stackCapacity), parseResult_(), curDepth_(0), maxDepth_(0)
+            allocator_(allocator), ownAllocator_(0), stack_(stackAllocator, stackCapacity), parseResult_(), curDepth_(0), maxDepth_(0) // AMZN
     {
         if (!allocator_)
             ownAllocator_ = allocator_ = RAPIDJSON_NEW(Allocator)();
@@ -3377,7 +3569,7 @@ public:
 
     size_t GetMaxDepth() const { return maxDepth_; }
 
-    bool StartObject() { new (stack_.template Push<ValueType>()) ValueType(kObjectType); return IncrDepth(); }
+    bool StartObject() { new (stack_.template Push<ValueType>()) ValueType(kObjectType); return IncrDepth(); } // AMZN
 
     bool Key(const Ch* str, SizeType length, bool copy, bool noescape) {
         (void)(copy); // Unused.
@@ -3392,7 +3584,7 @@ public:
         return DecrDepth();
     }
 
-    bool StartArray() { new (stack_.template Push<ValueType>()) ValueType(kArrayType); return IncrDepth(); }
+    bool StartArray() { new (stack_.template Push<ValueType>()) ValueType(kArrayType); return IncrDepth(); } // AMZN
 
     bool EndArray(SizeType elementCount) {
         ValueType* elements = stack_.template Pop<ValueType>(elementCount);
@@ -3461,8 +3653,8 @@ public:
     SizeType Size() const { return value_.Size(); }
     SizeType Capacity() const { return value_.Capacity(); }
     bool Empty() const { return value_.Empty(); }
-    void Clear() const { value_.Clear(); }
-    ValueType& operator[](SizeType index) const {  return value_[index]; }
+    void Clear(AllocatorType &allocator) const { value_.Clear(allocator); }
+    ValueType& operator[](SizeType index) const { return value_[index]; }
     ValueIterator Begin() const { return value_.Begin(); }
     ValueIterator End() const { return value_.End(); }
     GenericArray Reserve(SizeType newCapacity, AllocatorType &allocator) const { value_.Reserve(newCapacity, allocator); return *this; }
@@ -3472,9 +3664,9 @@ public:
 #endif // RAPIDJSON_HAS_CXX11_RVALUE_REFS
     GenericArray PushBack(StringRefType value, AllocatorType& allocator) const { value_.PushBack(value, allocator); return *this; }
     template <typename T> RAPIDJSON_DISABLEIF_RETURN((internal::OrExpr<internal::IsPointer<T>, internal::IsGenericValue<T> >), (const GenericArray&)) PushBack(T value, AllocatorType& allocator) const { value_.PushBack(value, allocator); return *this; }
-    GenericArray PopBack() const { value_.PopBack(); return *this; }
-    ValueIterator Erase(ConstValueIterator pos) const { return value_.Erase(pos); }
-    ValueIterator Erase(ConstValueIterator first, ConstValueIterator last) const { return value_.Erase(first, last); }
+    GenericArray PopBack(AllocatorType& allocator) const { value_.PopBack(allocator); return *this; }
+    ValueIterator EraseJV(ConstValueIterator pos) const { return value_.EraseJV(pos); }
+    ValueIterator EraseJV(ConstValueIterator first, ConstValueIterator last) const { return value_.EraseJV(first, last); }
 
 #if RAPIDJSON_HAS_CXX11_RANGE_FOR
     ValueIterator begin() const { return value_.Begin(); }

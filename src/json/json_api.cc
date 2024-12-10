@@ -118,3 +118,15 @@ int get_json_values_and_types(ValkeyModuleCtx *ctx, const char *keyname, const s
     }
     return 0;
 }
+
+int get_json_vector_f32(ValkeyModuleCtx *ctx, const char *keyname, const size_t key_len, const char *path,
+        const size_t dimensionality, float **vector) {
+    *vector = nullptr;
+    JDocument *doc = get_json_document(ctx, keyname, key_len);
+    if (doc == nullptr) return -1;
+
+    bool is_v2_path;
+    *vector = static_cast<float*>(dom_array_vectorize(doc, path, dimensionality, VectorType::kFloat32Type, is_v2_path));
+    if (*vector == nullptr) return -1;
+    return 0;
+}
