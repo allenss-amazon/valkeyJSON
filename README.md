@@ -1,8 +1,8 @@
-# ValkeyJSON
+# Valkey JSON
 
-ValkeyJSON is a C++ Valkey-Module that provides native JSON (JavaScript Object Notation) support for Valkey. The implementation complies with RFC7159 and ECMA-404 JSON data interchange standards. Users can natively store, query, and modify JSON data structures using the JSONPath query language. The query expressions support advanced capabilities including wildcard selections, filter expressions, array slices, union operations, and recursive searches.
+Valkey-json is a Valkey module written in C++ that provides native JSON (JavaScript Object Notation) support for Valkey. The implementation complies with RFC7159 and ECMA-404 JSON data interchange standards. Users can natively store, query, and modify JSON data structures using the JSONPath query language. The query expressions support advanced capabilities including wildcard selections, filter expressions, array slices, union operations, and recursive searches.
 
-ValkeyJSON leverages [RapidJSON](https://rapidjson.org/), a high-performance JSON parser and generator for C++, chosen for its small footprint and exceptional performance and memory efficiency. As a header-only library with no external dependencies, RapidJSON provides robust Unicode support while maintaining a compact memory profile of just 16 bytes per JSON value on most 32/64-bit machines.
+Valkey-json leverages [RapidJSON](https://rapidjson.org/), a high-performance JSON parser and generator for C++, chosen for its small footprint and exceptional performance and memory efficiency. As a header-only library with no external dependencies, RapidJSON provides robust Unicode support while maintaining a compact memory profile of just 16 bytes per JSON value on most 32/64-bit machines.
 
 ## Building and Testing
 
@@ -14,18 +14,23 @@ ValkeyJSON leverages [RapidJSON](https://rapidjson.org/), a high-performance JSO
 
 The default valkey version is "unstable". To override it, do:
 ```text
-# Build valkey-server (8.0.0) and run integration tests
-SERVER_VERSION=8.0.0 ./build.sh
+# Build valkey-server (8.0) and run integration tests
+SERVER_VERSION=8.0 ./build.sh
 ```
 
 Custom compiler flags can be passed to the build script via environment variable CFLAGS. For example:
 ```text
 CFLAGS="-O0 -Wno-unused-function" ./build.sh
 ```
+#### To build the module with ASAN and run tests
+```text
+export ASAN_BUILD=true
+./build.sh
+```
 
 #### To build just the module
 ```text
-mdkir build
+mkdir build
 cd build
 cmake ..
 make
@@ -33,15 +38,15 @@ make
 
 The default valkey version is "unstable". To override it, do:
 ```text
-mdkir build
+mkdir build
 cd build
-cmake .. -DVALKEY_VERSION=8.0.0
+cmake .. -DVALKEY_VERSION=8.0
 make
 ```
 
 Custom compiler flags can be passed to cmake via variable CFLAGS. For example:
 ```text
-mdkir build
+mkdir build
 cd build
 cmake .. -DCFLAGS="-O0 -Wno-unused-function"
 make
@@ -104,11 +109,11 @@ JSON.DEL
 JSON.FORGET
 JSON.GET
 JSON.MGET
-JSON.MSET (#16)
+JSON.MSET
 JSON.NUMINCRBY
 JSON.NUMMULTBY
-JSON.OBJLEN
 JSON.OBJKEYS
+JSON.OBJLEN
 JSON.RESP
 JSON.SET
 JSON.STRAPPEND
